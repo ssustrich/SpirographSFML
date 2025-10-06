@@ -1,5 +1,5 @@
-﻿// nested_spiro_sfml3.cpp
-// Build with: C++17+ and SFML 3 (graphics, window, system)
+﻿// main.cpp — Nested Spirograph (SFML 3.0)
+// Build: C++17+ and link SFML 3 (graphics, window, system)
 
 #include <SFML/Graphics.hpp>
 #include <cmath>
@@ -9,9 +9,13 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+#include <algorithm>
+#include <math.h>
 
 // ---------- helpers ----------
 static inline sf::Vector2f V2(float x, float y) { return { x, y }; }
+
+
 
 static sf::Color hsv(float h, float s, float v, std::uint8_t a = 230) {
     float c = v * s;
@@ -28,11 +32,11 @@ static sf::Color hsv(float h, float s, float v, std::uint8_t a = 230) {
     return sf::Color(to8(r + m), to8(g + m), to8(b + m), a);
 }
 
-// Draw one thick gradient segment into a RenderTarget
 static void drawThickSegment(sf::RenderTarget& target,
     const sf::Vector2f& a, const sf::Vector2f& b,
-    float stroke, const sf::Color& ca, const sf::Color& cb) {
-    sf::Vector2f d = b - a;
+    float stroke, const sf::Color& ca, const sf::Color& cb)
+{
+    sf::Vector2f d{ b.x - a.x, b.y - a.y };
     float len = std::hypot(d.x, d.y);
     if (len < 0.0001f) return;
 
@@ -41,12 +45,13 @@ static void drawThickSegment(sf::RenderTarget& target,
     n.y *= (stroke * 0.5f);
 
     sf::Vertex quad[4] = {
-        sf::Vertex{ a - n, ca }, sf::Vertex{ a + n, ca },
-        sf::Vertex{ b + n, cb }, sf::Vertex{ b - n, cb }
+        sf::Vertex{ sf::Vector2f{ a.x - n.x, a.y - n.y }, ca },
+        sf::Vertex{ sf::Vector2f{ a.x + n.x, a.y + n.y }, ca },
+        sf::Vertex{ sf::Vector2f{ b.x + n.x, b.y + n.y }, cb },
+        sf::Vertex{ sf::Vector2f{ b.x - n.x, b.y - n.y }, cb }
     };
     target.draw(quad, 4, sf::PrimitiveType::TriangleFan);
 
-    // round caps hide tiny gaps at joints
     float rcap = stroke * 0.5f;
     sf::CircleShape cap(rcap);
     cap.setOrigin({ rcap, rcap });
@@ -54,21 +59,26 @@ static void drawThickSegment(sf::RenderTarget& target,
     cap.setFillColor(cb); cap.setPosition(b); target.draw(cap);
 }
 
-// ---------- nested model ----------
+// ---------- model ----------
 struct Stage {
-    float r;       // rolling circle radius (this stage)
-    float d;       // pen offset if this is the LAST stage; ignored otherwise
-    bool outside;  // false=rolls inside previous circle, true=outside
+    int   level = 1; 
+    float r;        // rolling disc radius
+    float d;        // pen offset (used only by the LAST stage)
+    bool  outside;  // false = inside roll; true = outside roll
+    float speed;    // radians/sec (negative = reverse)
+    float phase;    // start angle (radians)
 
-    // render styling for this stage's trace (only used by last stage)
-    float stroke = 3.f;
+    // last-stage style
+    float stroke = 1.f;
     bool  rainbow = true;
-    float pixelsPerCycle = 500.f;
+    float pixelsPerCycle = 600.f;
     float hueOffset = 0.f;
 
     // visuals
-    sf::CircleShape disc; // the rolling circle itself
-    Stage(float rr, float dd, bool out) : r(rr), d(dd), outside(out), disc(rr) {
+    sf::CircleShape disc;
+    Stage(int lvl, float rr, float dd, bool out, float spd, float ph = (3.14159f/-2))
+        : level(lvl), r(rr), d(dd), outside(out), speed(spd), phase(ph), disc(rr)
+    {
         disc.setOrigin({ r, r });
         disc.setFillColor(sf::Color::Transparent);
         disc.setOutlineThickness(2.f);
@@ -77,78 +87,150 @@ struct Stage {
     }
 };
 
-// Compute the nested pen position and stage centers.
-// Conventions (screen coords): +x right, +y down. Angles are standard radians.
-static sf::Vector2f nestedPenAndCenters(float R,
-    const std::vector<Stage>& stages,
-    float theta0,
-    std::vector<sf::Vector2f>* outCenters) {
-    if (outCenters) outCenters->clear();
-    sf::Vector2f acc = { 0.f, 0.f }; // accumulated position from origin
-    float alpha = theta0;          // driving angle for this stage (chained)
 
+// Nested centers + pen with per-stage speeds.
+// Returns local coords (add screen center to draw).
+static sf::Vector2f nestedPenAndCenters_perStageSpeed(float R,
+    const std::vector<Stage>& stages,
+    float t,
+    std::vector<sf::Vector2f>* outCenters)
+{
+    if (outCenters) outCenters->clear();
+    sf::Vector2f acc{ 0.f, 0.f };
     float baseRadius = R;
+
     for (std::size_t j = 0; j < stages.size(); ++j) {
         const Stage& s = stages[j];
-        float kappa = s.outside ? (baseRadius + s.r) : (baseRadius - s.r); // center path radius
-        // center of this rolling disc relative to previous center, at angle 'alpha'
-        acc += V2(kappa * std::cos(alpha), kappa * std::sin(alpha));
-        if (outCenters) outCenters->push_back(acc);
+        float alpha = s.speed * t + s.phase;
+        float kappa = s.outside ? (baseRadius + s.r) : (baseRadius - s.r);
 
-        // internal spin ratio for what's attached to this disc (next stage or pen)
-        float freq = kappa / s.r;
-        float beta = freq * alpha; // chained rolling without slip
+        acc.x += kappa * std::cos(alpha);
+        acc.y += kappa * std::sin(alpha);
+        if (outCenters) outCenters->push_back(acc);
 
         bool last = (j + 1 == stages.size());
         if (last) {
-            // Apply the pen offset on the LAST stage
-            // For outside roll: subtract (cos,sin); for inside: add cos, subtract sin
+            float freq = kappa / s.r;
+            float beta = freq * alpha;
             float ox, oy;
-            if (s.outside) {
-                ox = -s.d * std::cos(beta);
-                oy = -s.d * std::sin(beta);
-            }
-            else {
-                ox = s.d * std::cos(beta);
-                oy = -s.d * std::sin(beta);
-            }
-            acc += V2(ox, oy);
+            if (s.outside) { ox = -s.d * std::cos(beta); oy = -s.d * std::sin(beta); }
+            else { ox = s.d * std::cos(beta); oy = -s.d * std::sin(beta); }
+            acc.x += ox; acc.y += oy;
         }
         else {
-            // Next stage rolls on THIS disc: its center angle is this disc's spin angle
-            alpha = beta;
-            baseRadius = s.r; // next stage rolls on current disc with radius r_j
+            baseRadius = s.r; // next stage rolls on this disc
         }
     }
     return acc;
 }
+// Returns the pen *local* position at time t (no centers allocated)
+static inline sf::Vector2f penAtTime(float R,
+    const std::vector<Stage>& chain,
+    float t) {
+    return nestedPenAndCenters_perStageSpeed(R, chain, t, nullptr);
+}
+// ---------- help overlay ----------
+struct HelpOverlay {
+    bool visible = false;
+    std::optional<sf::Text> text;   // sf::Text has no default ctor in SFML 3
+    sf::RectangleShape bg;
 
+    static constexpr float kPad = 16.f;
+
+    void init(const sf::Font& font, const sf::Vector2f& pos = { 40.f, 40.f }) {
+        text.emplace(font);                 // construct with a font
+        text->setCharacterSize(18);
+        text->setFillColor(sf::Color::White);
+        text->setPosition(pos);
+        rebuild();
+    }
+
+    void rebuild() {
+        if (!text) return;
+
+        text->setString(
+            "Controls\n"
+            "------------\n"
+            "General\n"
+            "  Esc          Quit\n"
+            "  Space        Trace on/off\n"
+            "  C            Clear trace\n"
+            "  P            Save PNG\n"
+            "  M            Show/hide mechanism\n"
+            "  H / F1       Toggle this help\n"
+            "\nPer-stage editing\n"
+            "  PgUp / PgDn  Selected Stage +/-\n"
+            "  [ / ]        Speed - / +\n"
+            "  Z            Flip direction\n"
+            "\nBase circle\n"
+            "  Up / Down    R +/-\n"
+
+        );
+
+        // Use GLOBAL bounds (SFML 3: Rect has .position and .size)
+        const auto gb = text->getGlobalBounds();
+        bg.setSize({ gb.size.x + kPad * 2.f, gb.size.y + kPad * 2.f });
+        bg.setPosition({ gb.position.x - kPad, gb.position.y - kPad });
+        bg.setFillColor(sf::Color(0, 0, 0, 200));
+        bg.setOutlineThickness(2.f);
+        bg.setOutlineColor(sf::Color(255, 255, 255, 80));
+    }
+
+    void setPosition(const sf::Vector2f& pos) {
+        if (!text) return;
+        text->setPosition(pos);
+        // keep box in sync
+        const auto gb = text->getGlobalBounds();
+        bg.setSize({ gb.size.x + kPad * 2.f, gb.size.y + kPad * 2.f });
+        bg.setPosition({ gb.position.x - kPad, gb.position.y - kPad });
+    }
+
+    void draw(sf::RenderTarget& rt) const {
+        if (!visible || !text) return;
+        rt.draw(bg);
+        rt.draw(*text);
+    }
+};
 int main() {
     constexpr unsigned kW = 1280, kH = 900;
+    // --- trace resolution control ---
+    float maxPixelStep = 1.f;  // max pixels per sub-segment; lower = smoother
+    int   maxSubsteps = 256;   // safety cap
+
+    // keep last time for sub-stepping
+    float lastT = 0.f;
+
+    // Anti-aliased window (MSAA)
     sf::ContextSettings settings; settings.antiAliasingLevel = 8;
-    sf::RenderWindow window(sf::VideoMode({ kW, kH }), "Nested Spirograph (SFML 3)",
+    sf::RenderWindow window(sf::VideoMode({ kW, kH }), "Nested Spirograph — per-stage speed (SFML 3)",
         sf::State::Windowed, settings);
     window.setFramerateLimit(120);
 
-    const sf::Vector2f center = V2(kW * 0.5f, kH * 0.5f);
+    const sf::Vector2f screenCenter = V2(kW * 0.5f, kH * 0.5f);
 
-    // Big fixed circle (base)
-    float R = 260.f;
+    // Base circle
+    float R = 200.f;
     sf::CircleShape big(R);
     big.setOrigin({ R, R });
-    big.setPosition(center);
+    big.setPosition(screenCenter);
     big.setFillColor(sf::Color::Transparent);
     big.setOutlineThickness(2.f);
-    big.setOutlineColor(sf::Color(180, 180, 180));
+    big.setOutlineColor(sf::Color(180, 180, 180, 10));
     big.setPointCount(220);
 
-    // Define a nested chain: stage1 rolls on big, stage2 on stage1, stage3 on stage2.
+    // Stages (distinct speeds; negative reverses)
     std::vector<Stage> chain;
-    chain.emplace_back(/*r*/ 90.f, /*d*/ 60.f, /*outside*/ false);  // inside big
-    chain.emplace_back(/*r*/ 50.f, /*d*/ 35.f, /*outside*/ true);   // outside the previous disc
-    chain.emplace_back(/*r*/ 30.f, /*d*/ 55.f, /*outside*/ false);  // inside the previous disc
 
-    // Trace surface (smooth + MSAA)
+    float startRadius = R;
+    float startDistantce = 0.f;
+    int startSpeed = -4;
+    for (int i = 0; i <= 9; i++) {
+        startRadius /= 3;
+        startDistantce /= 3;
+        chain.emplace_back(i, /*r*/startRadius, /*d*/ startDistantce, /*outside*/ true, /*speed*/pow(startSpeed, i));
+    }
+
+    // Trace surface
     sf::RenderTexture traceRT;
     traceRT.resize({ kW, kH }, settings);
     traceRT.setSmooth(true);
@@ -158,9 +240,12 @@ int main() {
 
     // HUD
     sf::Font font;
-    bool haveFont = font.openFromFile("Consola.ttf")
+    /*bool haveFont = font.openFromFile("consolai.ttf")
         || font.openFromFile("consola.ttf")
-        || font.openFromFile("arial.ttf");
+        || font.openFromFile("arial.ttf");*/
+
+    bool haveFont = font.openFromFile("assets/fonts/CONSOLA.TTF");// place a TTF beside your exe
+
     std::optional<sf::Text> hud;
     if (haveFont) {
         hud.emplace(font);
@@ -169,125 +254,213 @@ int main() {
         hud->setPosition({ 12.f, 10.f });
     }
 
-    // Controls/state
+    // Help
+    HelpOverlay help;
+    if (haveFont) help.init(font);
+
+    // State
     bool tracing = true;
     bool showMechanism = true;
-    float speed = 0.9f;          // base angular speed (rad/s) for first stage
+    int  sel = 0; // selected stage
     float t = 0.f;
     sf::Clock clock;
 
-    // Rainbow-by-length
+    // Rainbow path control
     float pathLen = 0.f;
     float pixelsPerCycle = 600.f;
     float hueOffset = 0.f;
-    float stroke = 6.f;
+    float stroke = 22.f;
 
     bool haveLast = false;
     sf::Vector2f lastPen{};
 
+    auto wrapIndex = [&](int i) {
+        int n = static_cast<int>(chain.size());
+        if (n == 0) return 0;
+        i %= n; if (i < 0) i += n;
+        return i;
+        };
+
+
     auto updateHud = [&] {
         if (!hud) return;
         std::ostringstream ss;
-        ss << "Space: trace on/off | M: toggle mechanism | C: clear | P: save PNG\n"
-            << "E: flip in/out on last stage | Arrows: R +/- | +/-: speed +/-\n"
-            << "R=" << int(R) << "  speed=" << speed
-            << "  stages=" << chain.size();
+        ss << "Selection: " << chain[sel].level << "\n"
+            <<"Speed: " << std::fixed << std::setprecision(2) << chain[sel].speed << "\n"
+            <<"Size: " << std::fixed << std::setprecision(2) << chain[sel].r << "\n"
+            <<"Outside Roll: " << chain[sel].outside << "\n"
+            <<"H/F1: help\n";
         hud->setString(ss.str());
         };
     updateHud();
 
     while (window.isOpen()) {
+        // ----- events -----
         while (const auto ev = window.pollEvent()) {
-            if (ev->is<sf::Event::Closed>()) window.close();
-            else if (const auto* k = ev->getIf<sf::Event::KeyPressed>()) {
+            if (ev->is<sf::Event::Closed>()) { window.close(); continue; }
+
+            if (const auto* k = ev->getIf<sf::Event::KeyPressed>()) {
                 using KS = sf::Keyboard::Scancode;
-                if (k->scancode == KS::Escape) window.close();
-                if (k->scancode == KS::Space) { tracing = !tracing; }
-                if (k->scancode == KS::M) { showMechanism = !showMechanism; }
-                if (k->scancode == KS::C) {
+
+                auto clampSel = [&]() {
+                    if (chain.empty()) sel = 0;
+                    else if (sel < 0) sel = 0;
+                    else if (sel >= int(chain.size())) sel = int(chain.size()) - 1;
+                    };
+
+                switch (k->scancode) {
+                    // app control
+                case KS::Escape:   window.close(); break;
+                case KS::Space:    tracing = !tracing; break;
+                case KS::M:        showMechanism = !showMechanism; break;
+                case KS::C:
                     traceRT.clear(sf::Color::Transparent); traceRT.display();
                     haveLast = false; pathLen = 0.f;
-                }
-                if (k->scancode == KS::P) {
+                    break;
+                case KS::PageUp:
+                    sel = wrapIndex(sel + 1);
+                    updateHud();
+                    break;
+                    // flip inside/outside on the last stage for fun
+                case KS::E:
+                    chain[sel].outside = !chain[sel].outside;
+                    updateHud();
+                    break;
+                case KS::PageDown:
+                    sel = wrapIndex(sel - 1);
+                    updateHud();
+                    break;
+                case KS::P: {
                     auto img = traceRT.getTexture().copyToImage();
                     static int n = 0; std::ostringstream name;
-                    name << "nested_spiro_" << std::setw(3) << std::setfill('0') << n++ << ".png";
+                    name << "nested_pss_" << std::setw(3) << std::setfill('0') << n++ << ".png";
                     img.saveToFile(name.str());
+                    break;
                 }
-                if (k->scancode == KS::E) {
-                    // flip inside/outside on the last stage for fun
-                    chain.back().outside = !chain.back().outside; haveLast = false;
+                case KS::H:
+                case KS::F1:
+                    help.visible = !help.visible;
+                    break;
+                    // base radius
+                case KS::Up:
+                    R += 5.f; big.setRadius(R); big.setOrigin({ R,R }); updateHud(); break;
+                case KS::Down:
+                    R = std::max(20.f, R - 5.f); big.setRadius(R); big.setOrigin({ R,R }); updateHud(); break;
+
+                    // per-stage speed (correct bracket names in SFML 3)
+                case KS::LBracket:  chain[sel].speed -= 0.1f; updateHud(); break; // [
+                case KS::RBracket:  chain[sel].speed += 0.1f; updateHud(); break; // ]
+                case KS::Z:         chain[sel].speed = -chain[sel].speed; updateHud(); break;
+
+                default: break;
                 }
-                if (k->scancode == KS::Up) { R += 5.f;  big.setRadius(R); big.setOrigin({ R,R }); updateHud(); }
-                if (k->scancode == KS::Down) { R = std::max(20.f, R - 5.f); big.setRadius(R); big.setOrigin({ R,R }); updateHud(); }
-                if (k->scancode == KS::Equal) { speed += 0.1f; updateHud(); }     // '=' key
-                if (k->scancode == KS::Hyphen) { speed = std::max(0.1f, speed - 0.1f); updateHud(); }
             }
         }
 
-        float dt = clock.restart().asSeconds();
-        t += speed * dt;
-
-        // Compute centers & pen
-        std::vector<sf::Vector2f> centers;
-        sf::Vector2f penLocal = nestedPenAndCenters(R, chain, t, &centers);
-        sf::Vector2f penPos = center + penLocal;
-
-        // Rainbow/thick trace
-        if (tracing) {
-            float prevLen = pathLen;
-            if (haveLast) pathLen += std::hypot(penPos.x - lastPen.x, penPos.y - lastPen.y);
-
-            float h0 = std::fmod((prevLen / pixelsPerCycle) * 360.f + hueOffset, 360.f);
-            float h1 = std::fmod((pathLen / pixelsPerCycle) * 360.f + hueOffset, 360.f);
-            sf::Color c0 = hsv(h0, 1.f, 1.f);
-            sf::Color c1 = hsv(h1, 1.f, 1.f);
-
-            if (haveLast) {
-                drawThickSegment(traceRT, lastPen, penPos, chain.back().stroke, c0, c1);
+            // ----- update -----
+            float dt = clock.restart().asSeconds();
+            if (!help.visible) { // pause sim while help is visible (optional)
+                t += dt;
             }
-            haveLast = true;
-            lastPen = penPos;
-            traceRT.display();
-        }
-        else {
-            haveLast = false;
-        }
 
-        // Update rolling discs' on-screen positions
-        for (std::size_t i = 0; i < chain.size(); ++i) {
-            chain[i].disc.setPosition(center + centers[i]);
-        }
+            // centers & pen
+            std::vector<sf::Vector2f> centers;
+            sf::Vector2f penLocal = nestedPenAndCenters_perStageSpeed(R, chain, t, &centers);
+            sf::Vector2f penPos = screenCenter + penLocal;
 
-        // Draw
-        window.clear(sf::Color(15, 18, 22));
-        window.draw(traceSprite);
-        window.draw(big);
+            // ======== trace (adaptive sub-sampling) ========
+            if (tracing && !help.visible) {
+                // where we *want* to be this frame
+                const sf::Vector2f currPen = screenCenter + penAtTime(R, chain, t);
 
-        if (showMechanism) {
-            // small circles and arm lines
+                if (!haveLast) {
+                    // first point in a run
+                    haveLast = true;
+                    lastPen = currPen;
+                    lastT = t;
+                }
+
+                // Decide how many sub-steps based on screen distance
+                const float dist = std::hypot(currPen.x - lastPen.x, currPen.y - lastPen.y);
+                int steps = static_cast<int>(std::ceil(dist / std::max(0.1f, maxPixelStep)));
+                steps = std::clamp(steps, 1, maxSubsteps);
+
+                sf::Vector2f prev = lastPen;
+                float prevT = lastT;
+
+                for (int i = 1; i <= steps; ++i) {
+                    float s = static_cast<float>(i) / static_cast<float>(steps);
+                    float ti = lastT + (t - lastT) * s;
+
+                    sf::Vector2f p = screenCenter + penAtTime(R, chain, ti);
+
+                    // rainbow by length (small segments, smooth gradient)
+                    float prevLen = pathLen;
+                    pathLen += std::hypot(p.x - prev.x, p.y - prev.y);
+
+                    float h0 = std::fmod((prevLen / pixelsPerCycle) * 360.f + hueOffset, 360.f);
+                    float h1 = std::fmod((pathLen / pixelsPerCycle) * 360.f + hueOffset, 360.f);
+                    sf::Color c0 = hsv(h0, 1.f, 1.f);
+                    sf::Color c1 = hsv(h1, 1.f, 1.f);
+
+                    drawThickSegment(traceRT, prev, p, chain.back().stroke, c0, c1);
+
+                    prev = p;
+                    prevT = ti;
+                }
+
+                // finalize for next frame
+                lastPen = currPen;
+                lastT = t;
+                traceRT.display();
+            }
+            else {
+                haveLast = false; // stop the run
+            }
+
+
             for (std::size_t i = 0; i < chain.size(); ++i) {
+                chain[i].disc.setPosition(screenCenter + centers[i]);
+                chain[i].disc.setOutlineColor(i == static_cast<std::size_t>(sel)
+                    ? sf::Color(255, 230, 120)   // highlight color
+                    : sf::Color(140, 200, 255)); // normal color
                 window.draw(chain[i].disc);
-                // arm line from disc center to next element (either next disc center or pen)
-                sf::Vector2f from = center + centers[i];
-                sf::Vector2f to = (i + 1 < centers.size())
-                    ? (center + centers[i + 1])
-                    : penPos;
-                sf::Vertex arm[2] = { sf::Vertex{ from, sf::Color(120,200,140) },
-                                      sf::Vertex{ to,   sf::Color(120,200,140) } };
-                window.draw(arm, 2, sf::PrimitiveType::Lines);
+                // ... draw arm line as before ...
             }
+
+            // ----- draw -----
+
+            window.clear(sf::Color(15, 18, 22));
+            window.draw(traceSprite);
+            window.draw(big);
+
+            if (showMechanism) {
+                for (std::size_t i = 0; i < chain.size(); ++i) {
+                    window.draw(chain[i].disc);
+                    sf::Vector2f from = screenCenter + centers[i];
+                    sf::Vector2f to = (i + 1 < centers.size())
+                        ? (screenCenter + centers[i + 1])
+                        : penPos;
+                    sf::Vertex arm[2] = {
+                        sf::Vertex{ from, sf::Color(120,200,140) },
+                        sf::Vertex{ to,   sf::Color(120,200,140) }
+                    };
+                    window.draw(arm, 2, sf::PrimitiveType::Lines);
+                }
+            }
+
+            // pen dot
+            sf::CircleShape penDot(4.f);
+            penDot.setOrigin({ 4.f, 4.f });
+            penDot.setFillColor(sf::Color::Red);
+            penDot.setPosition(penPos);
+            window.draw(penDot);
+
+            if (hud)  window.draw(*hud);
+            help.draw(window);            // draw help overlay LAST
+            window.display();
         }
 
-        // draw the red pen dot
-        sf::CircleShape penDot(4.f);
-        penDot.setOrigin({ 4.f, 4.f });
-        penDot.setFillColor(sf::Color::Red);
-        penDot.setPosition(penPos);
-        window.draw(penDot);
 
-        if (hud) window.draw(*hud);
-        window.display();
-    }
     return 0;
 }
